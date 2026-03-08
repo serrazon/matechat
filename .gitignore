@@ -1,0 +1,15 @@
+# Compiled binary (root only)
+/matechat
+
+# Certificates and private keys — never commit
+testcerts/
+*.key
+*.crt
+*.pem
+
+# Go build artifacts
+*.test
+*.out
+
+# macOS
+.DS_Store
