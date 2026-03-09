@@ -243,7 +243,15 @@ func (m *Manager) connectPeer(name, addr string) {
 		if err != nil {
 			log.Printf("hole punch to %s failed: %v", name, err)
 
-			// 3. Try relay
+			// 3. Try relay — only the lexicographically smaller peer initiates,
+			// mirroring the tie-breaking in handleIncoming. This prevents both
+			// sides simultaneously acting as TLS client over the same relay session.
+			if m.selfName > name {
+				// The other peer has the smaller name and will initiate relay;
+				// we respond via handleRelayNotify when their relay_req arrives.
+				log.Printf("waiting for %s to initiate relay", name)
+				return
+			}
 			conn, err = m.dialRelay(name)
 			if err != nil {
 				log.Printf("relay to %s failed: %v — giving up", name, err)
