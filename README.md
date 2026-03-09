@@ -85,20 +85,38 @@ End-to-end encryption is inherent: the mTLS session is established between the t
 
 ---
 
-## Planned commands
+## Usage
 
 ```sh
 # Broker (Ubuntu VPS — runs as systemd service)
 matechat serve --cert server.crt --key server.key --ca family-ca.crt
 
 # Client (any device)
-matechat --broker chat.example.com --cert device.crt --key device.key
+matechat --broker chat.example.com:9000 --cert device.crt --key device.key --ca family-ca.crt
 
 # Cert management
 matechat certs init              # generate family CA (run once, keep offline)
 matechat certs issue --name mom  # sign a new device cert
-matechat certs revoke --name old-phone
 ```
+
+---
+
+## Connectivity
+
+matechat tries three methods in order when connecting to a peer:
+
+| Scenario | Method used |
+|---|---|
+| Same home network | Direct dial |
+| Different homes (residential internet) | Hole punch (works ~80% of the time) |
+| Mobile data | Hole punch usually works |
+| CGNAT / corporate firewall / strict NAT | Relay fallback |
+
+The relay fallback is always available. All three methods use end-to-end mTLS
+between the two client devices — even relay frames are opaque ciphertext to the broker.
+
+No port forwarding is required. The broker observes each client's public IP and
+combines it with the client's registered port to give peers a dialable address.
 
 ---
 
@@ -113,7 +131,7 @@ matechat certs revoke --name old-phone
 
 ## Status
 
-Early development. Architecture decided, implementation starting.
+Working implementation. Broker and client are fully functional: mTLS peer discovery, NAT hole punching, relay fallback, TUI chat, and local SQLite history are all implemented.
 
 ## License
 

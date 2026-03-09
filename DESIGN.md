@@ -155,6 +155,8 @@ sequenceDiagram
     Note over B: sees session_id + ciphertext only
 ```
 
+**Implementation note:** when both peers see each other in the peer list simultaneously, both would otherwise call `relay_req` and race to act as TLS client. To prevent this, only the peer with the lexicographically smaller name initiates relay; the other waits for `relay_notify`. This mirrors the same tie-breaking used for incoming direct connections in `handleIncoming`.
+
 ---
 
 ## 7. Send a message (P2P)
