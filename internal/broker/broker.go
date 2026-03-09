@@ -41,6 +41,7 @@ type RelaySession struct {
 type Broker struct {
 	tlsConfig *tls.Config
 	revokedCN map[string]bool // loaded once at startup
+	version   string
 
 	mu      sync.RWMutex
 	dir     map[string]*PeerEntry    // CN → entry
@@ -49,13 +50,14 @@ type Broker struct {
 }
 
 // New creates a new Broker with the given TLS configuration.
-func New(tlsCfg *tls.Config, revokedNames map[string]bool) *Broker {
+func New(tlsCfg *tls.Config, revokedNames map[string]bool, version string) *Broker {
 	if revokedNames == nil {
 		revokedNames = make(map[string]bool)
 	}
 	return &Broker{
 		tlsConfig: tlsCfg,
 		revokedCN: revokedNames,
+		version:   version,
 		dir:       make(map[string]*PeerEntry),
 		relays:    make(map[string]*RelaySession),
 		pending:   make(map[string]string),
@@ -69,7 +71,7 @@ func (b *Broker) ListenAndServe(addr string) error {
 		return fmt.Errorf("listen: %w", err)
 	}
 	defer ln.Close()
-	log.Printf("broker listening on %s", ln.Addr())
+	log.Printf("matechat broker %s listening on %s", b.version, ln.Addr())
 
 	for {
 		conn, err := ln.Accept()

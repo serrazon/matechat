@@ -4,7 +4,6 @@ import (
 	"crypto/x509"
 	"encoding/pem"
 	"fmt"
-	"log"
 	"os"
 	"path/filepath"
 
@@ -14,10 +13,14 @@ import (
 	"matechat/internal/broker"
 	"matechat/internal/certs"
 	"matechat/internal/client"
+	"matechat/internal/config"
 	"matechat/internal/peer"
 	"matechat/internal/proto"
 	"matechat/internal/store"
+	"matechat/internal/updater"
 )
+
+var version = "dev"
 
 var rootCmd = &cobra.Command{
 	Use:   "matechat",
@@ -54,6 +57,12 @@ var certsRevokeCmd = &cobra.Command{
 	RunE:  runCertsRevoke,
 }
 
+var updateCmd = &cobra.Command{
+	Use:   "update",
+	Short: "Check for a newer release and self-update",
+	RunE:  runUpdate,
+}
+
 // Global flags
 var (
 	flagCert   string
@@ -77,10 +86,11 @@ var (
 )
 
 func init() {
+	rootCmd.Version = version
 	rootCmd.PersistentFlags().StringVar(&flagCert, "cert", "", "path to device certificate")
 	rootCmd.PersistentFlags().StringVar(&flagKey, "key", "", "path to device private key")
 	rootCmd.PersistentFlags().StringVar(&flagCA, "ca", "", "path to family CA certificate")
-	rootCmd.Flags().StringVar(&flagBroker, "broker", "localhost:9000", "broker address")
+	rootCmd.Flags().StringVar(&flagBroker, "broker", "", "broker address (default from config or localhost:9000)")
 	rootCmd.Flags().StringVar(&flagListen, "listen", ":9100", "listen address for peer connections")
 	rootCmd.Flags().StringVar(&flagDB, "db", "", "path to local message database (default ~/.matechat/history.db)")
 
@@ -100,6 +110,7 @@ func init() {
 	certsCmd.AddCommand(certsRevokeCmd)
 	rootCmd.AddCommand(serveCmd)
 	rootCmd.AddCommand(certsCmd)
+	rootCmd.AddCommand(updateCmd)
 }
 
 func main() {
@@ -110,22 +121,40 @@ func main() {
 }
 
 func runClient(cmd *cobra.Command, args []string) error {
-	if flagCert == "" || flagKey == "" || flagCA == "" {
-		return fmt.Errorf("--cert, --key, and --ca are required")
+	// Load config file, then apply CLI flags as overrides
+	cfg, _ := config.Load()
+	if flagCert != "" {
+		cfg.Cert = flagCert
+	}
+	if flagKey != "" {
+		cfg.Key = flagKey
+	}
+	if flagCA != "" {
+		cfg.CA = flagCA
+	}
+	if flagBroker != "" {
+		cfg.Broker = flagBroker
+	}
+	if cfg.Broker == "" {
+		cfg.Broker = "localhost:9000"
+	}
+
+	if cfg.Cert == "" || cfg.Key == "" || cfg.CA == "" {
+		return fmt.Errorf("--cert, --key, and --ca are required (or set in ~/.matechat/config.json)")
 	}
 
 	// Load TLS configs
-	clientTLS, err := certs.LoadClientTLS(flagCert, flagKey, flagCA)
+	clientTLS, err := certs.LoadClientTLS(cfg.Cert, cfg.Key, cfg.CA)
 	if err != nil {
 		return fmt.Errorf("load client TLS: %w", err)
 	}
-	serverTLS, err := certs.LoadServerTLS(flagCert, flagKey, flagCA)
+	serverTLS, err := certs.LoadServerTLS(cfg.Cert, cfg.Key, cfg.CA)
 	if err != nil {
 		return fmt.Errorf("load server TLS: %w", err)
 	}
 
 	// Determine self name from cert
-	selfName, err := selfNameFromCert(flagCert)
+	selfName, err := selfNameFromCert(cfg.Cert)
 	if err != nil {
 		return err
 	}
@@ -171,10 +200,10 @@ func runClient(cmd *cobra.Command, args []string) error {
 		onMessage, onPeerJoin, onPeerLeave)
 
 	// Create TUI model with manager and shared channels
-	model := client.New(mgr, st, msgCh, joinCh, leaveCh)
+	model := client.New(mgr, st, msgCh, joinCh, leaveCh, version)
 
 	// Connect to broker
-	if err := mgr.ConnectBroker(flagBroker); err != nil {
+	if err := mgr.ConnectBroker(cfg.Broker); err != nil {
 		return fmt.Errorf("connect broker: %w", err)
 	}
 
@@ -194,21 +223,50 @@ func runClient(cmd *cobra.Command, args []string) error {
 }
 
 func runServe(cmd *cobra.Command, args []string) error {
-	if flagCert == "" || flagKey == "" || flagCA == "" {
-		return fmt.Errorf("--cert, --key, and --ca are required")
+	// Load config file, then apply CLI flags as overrides
+	cfg, _ := config.Load()
+	if flagCert != "" {
+		cfg.Cert = flagCert
+	}
+	if flagKey != "" {
+		cfg.Key = flagKey
+	}
+	if flagCA != "" {
+		cfg.CA = flagCA
 	}
 
-	tlsCfg, err := certs.LoadServerTLS(flagCert, flagKey, flagCA)
+	if cfg.Cert == "" || cfg.Key == "" || cfg.CA == "" {
+		return fmt.Errorf("--cert, --key, and --ca are required (or set in ~/.matechat/config.json)")
+	}
+
+	tlsCfg, err := certs.LoadServerTLS(cfg.Cert, cfg.Key, cfg.CA)
 	if err != nil {
 		return fmt.Errorf("load server TLS: %w", err)
 	}
 
-	revokedDir := filepath.Dir(flagCA)
+	revokedDir := filepath.Dir(cfg.CA)
 	revoked, _ := certs.LoadRevokedNames(revokedDir)
 
-	b := broker.New(tlsCfg, revoked)
-	log.Printf("starting broker on %s", flagServeAddr)
+	b := broker.New(tlsCfg, revoked, version)
 	return b.ListenAndServe(flagServeAddr)
+}
+
+func runUpdate(cmd *cobra.Command, args []string) error {
+	if version == "dev" {
+		fmt.Println("running a dev build — update only available for tagged releases")
+		return nil
+	}
+	fmt.Printf("current version: %s\nChecking for updates...\n", version)
+	newVer, err := updater.CheckAndUpdate(version)
+	if err != nil {
+		return fmt.Errorf("update failed: %w", err)
+	}
+	if newVer == "" {
+		fmt.Printf("already up to date (%s)\n", version)
+		return nil
+	}
+	fmt.Printf("updated to %s — restart matechat to use the new version\n", newVer)
+	return nil
 }
 
 func runCertsInit(cmd *cobra.Command, args []string) error {

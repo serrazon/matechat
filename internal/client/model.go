@@ -45,6 +45,7 @@ type Model struct {
 	store    *store.Store
 	messages []displayMsg
 	peers    []string
+	version  string
 
 	input    textinput.Model
 	viewport viewport.Model
@@ -60,7 +61,7 @@ type Model struct {
 
 // New creates a new Model with pre-created channels for manager communication.
 func New(manager *peer.Manager, st *store.Store,
-	msgCh chan proto.ChatMsg, joinCh, leaveCh chan string) Model {
+	msgCh chan proto.ChatMsg, joinCh, leaveCh chan string, version string) Model {
 	ti := textinput.New()
 	ti.Placeholder = "type a message..."
 	ti.Focus()
@@ -72,6 +73,7 @@ func New(manager *peer.Manager, st *store.Store,
 		msgChan: msgCh,
 		joinCh:  joinCh,
 		leaveCh: leaveCh,
+		version: version,
 	}
 }
 
@@ -185,7 +187,7 @@ func (m Model) renderHeader() string {
 	title := lipgloss.NewStyle().
 		Bold(true).
 		Foreground(lipgloss.Color("229")).
-		Render("matechat")
+		Render("matechat " + m.version)
 
 	var peers []string
 	for _, name := range m.peers {
@@ -261,8 +263,14 @@ func (m Model) loadHistory() tea.Cmd {
 
 func nameColor(name string) lipgloss.Color {
 	colors := []string{
-		"#E06C75", "#98C379", "#E5C07B", "#61AFEF",
-		"#C678DD", "#56B6C2", "#BE5046", "#D19A66",
+		"#E06B6B", // red     (  0°)
+		"#E0C36C", // gold    ( 45°)
+		"#A6E06C", // lime    ( 90°)
+		"#6CE089", // green   (135°)
+		"#6CE0E0", // cyan    (180°)
+		"#6C89E0", // blue    (225°)
+		"#A66CE0", // purple  (270°)
+		"#E06CC3", // pink    (315°)
 	}
 	h := fnv.New32a()
 	h.Write([]byte(name))
