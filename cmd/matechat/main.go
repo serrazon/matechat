@@ -1,11 +1,14 @@
 package main
 
 import (
+	"archive/zip"
 	"crypto/x509"
 	"encoding/pem"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
+	"strings"
 
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/spf13/cobra"
@@ -57,6 +60,19 @@ var certsRevokeCmd = &cobra.Command{
 	RunE:  runCertsRevoke,
 }
 
+var certsPackCmd = &cobra.Command{
+	Use:   "pack",
+	Short: "Issue a cert and bundle it into a ready-to-send zip pack",
+	RunE:  runCertsPack,
+}
+
+var setupCmd = &cobra.Command{
+	Use:   "setup <pack.zip>",
+	Short: "Install a matechat-pack zip into ~/.matechat/",
+	Args:  cobra.ExactArgs(1),
+	RunE:  runSetup,
+}
+
 var updateCmd = &cobra.Command{
 	Use:   "update",
 	Short: "Check for a newer release and self-update",
@@ -80,9 +96,10 @@ var (
 
 // Certs flags
 var (
-	flagCertsDir string
-	flagCertsOut string
-	flagCertName string
+	flagCertsDir  string
+	flagCertsOut  string
+	flagCertName  string
+	flagPackBroker string
 )
 
 func init() {
@@ -105,11 +122,20 @@ func init() {
 	certsRevokeCmd.Flags().StringVar(&flagCertName, "name", "", "device name to revoke")
 	certsRevokeCmd.MarkFlagRequired("name")
 
+	certsPackCmd.Flags().StringVar(&flagCertsDir, "ca-dir", ".", "directory containing CA files")
+	certsPackCmd.Flags().StringVar(&flagCertsOut, "out-dir", ".", "output directory for cert files and zip")
+	certsPackCmd.Flags().StringVar(&flagCertName, "name", "", "device name")
+	certsPackCmd.Flags().StringVar(&flagPackBroker, "broker", "", "broker address to embed in pack (e.g. myserver.com:9000)")
+	certsPackCmd.MarkFlagRequired("name")
+	certsPackCmd.MarkFlagRequired("broker")
+
 	certsCmd.AddCommand(certsInitCmd)
 	certsCmd.AddCommand(certsIssueCmd)
 	certsCmd.AddCommand(certsRevokeCmd)
+	certsCmd.AddCommand(certsPackCmd)
 	rootCmd.AddCommand(serveCmd)
 	rootCmd.AddCommand(certsCmd)
+	rootCmd.AddCommand(setupCmd)
 	rootCmd.AddCommand(updateCmd)
 }
 
@@ -302,6 +328,68 @@ func runCertsRevoke(cmd *cobra.Command, args []string) error {
 	}
 	fmt.Printf("Certificate for %q revoked\n", flagCertName)
 	fmt.Println("Send broker a SIGHUP to reload")
+	return nil
+}
+
+func runCertsPack(cmd *cobra.Command, args []string) error {
+	zipPath, err := certs.CreatePack(flagCertsDir, flagCertsOut, flagCertName, flagPackBroker)
+	if err != nil {
+		return err
+	}
+	fmt.Printf("Pack created: %s\n", zipPath)
+	fmt.Println("Send this file to the family member.")
+	fmt.Println("They run: matechat setup matechat-pack-" + flagCertName + ".zip")
+	return nil
+}
+
+func runSetup(cmd *cobra.Command, args []string) error {
+	packPath := args[0]
+
+	home, _ := os.UserHomeDir()
+	destDir := filepath.Join(home, ".matechat")
+	if err := os.MkdirAll(destDir, 0700); err != nil {
+		return fmt.Errorf("create ~/.matechat: %w", err)
+	}
+
+	r, err := zip.OpenReader(packPath)
+	if err != nil {
+		return fmt.Errorf("open pack: %w", err)
+	}
+	defer r.Close()
+
+	for _, f := range r.File {
+		dest := filepath.Join(destDir, filepath.Base(f.Name)) // flat extract, no path traversal
+
+		// Never overwrite existing private keys
+		if strings.HasSuffix(f.Name, ".key") {
+			if _, err := os.Stat(dest); err == nil {
+				fmt.Printf("  skipped (already exists): %s\n", f.Name)
+				continue
+			}
+		}
+
+		perm := os.FileMode(0644)
+		if strings.HasSuffix(f.Name, ".key") {
+			perm = 0600
+		}
+
+		rc, err := f.Open()
+		if err != nil {
+			return fmt.Errorf("read %s: %w", f.Name, err)
+		}
+		data, err := io.ReadAll(rc)
+		rc.Close()
+		if err != nil {
+			return fmt.Errorf("read %s: %w", f.Name, err)
+		}
+
+		if err := os.WriteFile(dest, data, perm); err != nil {
+			return fmt.Errorf("write %s: %w", f.Name, err)
+		}
+		fmt.Printf("  installed: %s\n", f.Name)
+	}
+
+	fmt.Println("\nSetup complete! Run: matechat")
 	return nil
 }
 

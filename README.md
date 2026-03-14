@@ -64,8 +64,8 @@ Authentication uses **mutual TLS (mTLS)** for every connection — client↔brok
 3. Both sides of every connection verify the peer's cert against the family CA
 4. Identity is derived from the certificate CN — never from message payloads
 
-Adding a family member = signing a new cert.
-Revoking access = remove their cert from the allowlist and send broker a SIGHUP.
+Adding a family member = `matechat certs pack` on the admin machine, then `matechat setup <pack.zip>` on their device.
+Revoking access = `matechat certs revoke --name <name>` and send the broker a SIGHUP.
 
 End-to-end encryption is inherent: the mTLS session is established between the two client devices directly. Even when the broker relays packets, it cannot decrypt them — it only sees the outer TLS layer.
 
@@ -97,7 +97,45 @@ matechat --broker chat.example.com:9000 --cert device.crt --key device.key --ca 
 # Cert management
 matechat certs init              # generate family CA (run once, keep offline)
 matechat certs issue --name mom  # sign a new device cert
+matechat certs revoke --name mom # revoke a device cert (send broker SIGHUP after)
 ```
+
+### Adding a new family member
+
+The fastest path is the pack workflow — two commands total.
+
+**Admin side** (whoever holds the CA):
+
+```sh
+matechat certs pack --name alice --broker chat.example.com:9000
+# Issues alice.crt + alice.key (kept locally too)
+# Produces: matechat-pack-alice.zip
+# Send this zip to Alice however you like (iMessage, email, AirDrop, etc.)
+```
+
+**Alice's side** (after downloading the binary once):
+
+```sh
+# Download the binary (one-time, pick the right platform)
+curl -L https://github.com/serrazon/matechat/releases/latest/download/matechat-darwin-arm64 \
+  -o matechat && chmod +x matechat
+
+# Install the pack
+./matechat setup matechat-pack-alice.zip
+# → Extracts alice.crt, alice.key, family-ca.crt, config.json into ~/.matechat/
+# → Done. Run: matechat
+```
+
+The zip contains everything Alice needs: her device cert, her private key, the family CA cert, and a `config.json` pre-filled with the broker address. No manual file copying or config editing required.
+
+Optional flags for `certs pack`:
+
+| Flag | Default | Description |
+|---|---|---|
+| `--name` | *(required)* | Device name used as the certificate CN |
+| `--broker` | *(required)* | Broker address embedded in the config (e.g. `chat.example.com:9000`) |
+| `--ca-dir` | `.` | Directory containing `family-ca.crt` and `family-ca.key` |
+| `--out-dir` | `.` | Where to write the cert files and zip |
 
 ---
 
