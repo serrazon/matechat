@@ -1,12 +1,16 @@
 package peer
 
 import (
+	"crypto/rand"
 	"crypto/tls"
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"io"
 	"log"
 	"net"
+	"os"
+	"path/filepath"
 	"sync"
 	"time"
 
@@ -35,9 +39,10 @@ type Manager struct {
 	pmu   sync.RWMutex
 
 	// Callbacks to TUI
-	onMessage   func(proto.ChatMsg)
-	onPeerJoin  func(name string)
-	onPeerLeave func(name string)
+	onMessage      func(proto.ChatMsg)
+	onPeerJoin     func(name string)
+	onPeerLeave    func(name string)
+	onFileReceived func(from, filename, localPath string)
 
 	// Signaling channels from broker read loop
 	peersCh     chan proto.PeersMsg
@@ -58,21 +63,23 @@ func NewManager(selfName, listenAddr string,
 	st *store.Store,
 	onMessage func(proto.ChatMsg),
 	onPeerJoin, onPeerLeave func(string),
+	onFileReceived func(from, filename, localPath string),
 ) *Manager {
 	return &Manager{
-		selfName:     selfName,
-		listenAddr:   listenAddr,
-		clientTLS:    clientTLS,
-		serverTLS:    serverTLS,
-		store:        st,
-		peers:        make(map[string]*Conn),
-		onMessage:    onMessage,
-		onPeerJoin:   onPeerJoin,
-		onPeerLeave:  onPeerLeave,
-		peersCh:      make(chan proto.PeersMsg, 8),
-		punchCh:      make(chan proto.PunchNotifyMsg, 8),
-		relayReadyCh: make(chan proto.RelayReadyMsg, 8),
-		relayConns:   make(map[string]*relayConn),
+		selfName:       selfName,
+		listenAddr:     listenAddr,
+		clientTLS:      clientTLS,
+		serverTLS:      serverTLS,
+		store:          st,
+		peers:          make(map[string]*Conn),
+		onMessage:      onMessage,
+		onPeerJoin:     onPeerJoin,
+		onPeerLeave:    onPeerLeave,
+		onFileReceived: onFileReceived,
+		peersCh:        make(chan proto.PeersMsg, 8),
+		punchCh:        make(chan proto.PunchNotifyMsg, 8),
+		relayReadyCh:   make(chan proto.RelayReadyMsg, 8),
+		relayConns:     make(map[string]*relayConn),
 	}
 }
 
@@ -285,7 +292,7 @@ func (m *Manager) dialDirect(name, addr string) (*Conn, error) {
 		return nil, fmt.Errorf("expected peer %s, got %s", name, peerName)
 	}
 
-	return newConn(name, tlsConn, m.store, m.onMessage, m.handlePeerLeave), nil
+	return newConn(name, "direct", tlsConn, m.store, m.onMessage, m.handlePeerLeave, m.onFileReceived), nil
 }
 
 func (m *Manager) dialHolePunch(name string) (*Conn, error) {
@@ -345,7 +352,7 @@ punch:
 		return nil, fmt.Errorf("hole punch: expected %s, got %s", name, peerName)
 	}
 
-	return newConn(name, tlsConn, m.store, m.onMessage, m.handlePeerLeave), nil
+	return newConn(name, "holepunch", tlsConn, m.store, m.onMessage, m.handlePeerLeave, m.onFileReceived), nil
 }
 
 func (m *Manager) dialRelay(name string) (*Conn, error) {
@@ -418,7 +425,7 @@ gotReady:
 	}
 
 	log.Printf("relay session %s established with %s", ready.SessionID, name)
-	return newConn(name, tlsConn, m.store, m.onMessage, m.handlePeerLeave), nil
+	return newConn(name, "relay", tlsConn, m.store, m.onMessage, m.handlePeerLeave, m.onFileReceived), nil
 }
 
 // acceptLoop accepts incoming P2P connections from the already-started listener.
@@ -472,7 +479,7 @@ func (m *Manager) handleIncoming(tlsConn *tls.Conn) {
 		}
 	}
 
-	c := newConn(name, tlsConn, m.store, m.onMessage, m.handlePeerLeave)
+	c := newConn(name, "direct", tlsConn, m.store, m.onMessage, m.handlePeerLeave, m.onFileReceived)
 	m.addPeer(c)
 }
 
@@ -549,7 +556,7 @@ gotReady:
 	}
 
 	log.Printf("relay session %s accepted from %s", ready.SessionID, peerName)
-	c := newConn(peerName, tlsConn, m.store, m.onMessage, m.handlePeerLeave)
+	c := newConn(peerName, "relay", tlsConn, m.store, m.onMessage, m.handlePeerLeave, m.onFileReceived)
 	m.addPeer(c)
 }
 
@@ -626,6 +633,23 @@ func (m *Manager) OnlinePeers() []string {
 	return names
 }
 
+// PeerStatus holds the name and connection type of a connected peer.
+type PeerStatus struct {
+	Name     string
+	ConnType string // "direct", "holepunch", "relay"
+}
+
+// OnlinePeerStatuses returns status info for all connected peers.
+func (m *Manager) OnlinePeerStatuses() []PeerStatus {
+	m.pmu.RLock()
+	defer m.pmu.RUnlock()
+	statuses := make([]PeerStatus, 0, len(m.peers))
+	for _, c := range m.peers {
+		statuses = append(statuses, PeerStatus{Name: c.PeerName, ConnType: c.ConnType})
+	}
+	return statuses
+}
+
 // Shutdown cleanly disconnects from all peers and the broker.
 func (m *Manager) Shutdown() {
 	m.pmu.Lock()
@@ -645,6 +669,82 @@ func (m *Manager) Shutdown() {
 	if m.listener != nil {
 		m.listener.Close()
 	}
+}
+
+// SendFile reads the file at path and broadcasts it to all connected peers
+// as an upload_start announcement followed by binary chunk frames.
+func (m *Manager) SendFile(path string) error {
+	const chunkSize = 512 * 1024 // 512 KB per chunk
+
+	info, err := os.Stat(path)
+	if err != nil {
+		return fmt.Errorf("stat: %w", err)
+	}
+	if info.IsDir() {
+		return fmt.Errorf("cannot send a directory")
+	}
+
+	f, err := os.Open(path)
+	if err != nil {
+		return fmt.Errorf("open: %w", err)
+	}
+	defer f.Close()
+
+	size := info.Size()
+	filename := filepath.Base(path)
+
+	var tidBytes [16]byte
+	if _, err := rand.Read(tidBytes[:]); err != nil {
+		return fmt.Errorf("generate transfer ID: %w", err)
+	}
+	tidHex := hex.EncodeToString(tidBytes[:])
+
+	chunkCount := int((size + chunkSize - 1) / chunkSize)
+	if chunkCount == 0 {
+		chunkCount = 1 // always send at least one chunk (handles empty files)
+	}
+
+	// Snapshot connected peers so we hold no lock during I/O.
+	m.pmu.RLock()
+	peers := make([]*Conn, 0, len(m.peers))
+	for _, c := range m.peers {
+		peers = append(peers, c)
+	}
+	m.pmu.RUnlock()
+
+	if len(peers) == 0 {
+		return fmt.Errorf("no peers connected")
+	}
+
+	start := proto.UploadStartMsg{
+		Type:       "upload_start",
+		TransferID: tidHex,
+		Filename:   filename,
+		Size:       size,
+		Chunks:     chunkCount,
+	}
+	for _, c := range peers {
+		if err := proto.WriteTextFrame(c.tlsConn, &c.wmu, start); err != nil {
+			log.Printf("send upload_start to %s: %v", c.PeerName, err)
+		}
+	}
+
+	buf := make([]byte, chunkSize)
+	for i := 0; i < chunkCount; i++ {
+		n, err := io.ReadFull(f, buf)
+		if err != nil && err != io.ErrUnexpectedEOF {
+			return fmt.Errorf("read chunk %d: %w", i, err)
+		}
+		chunk := buf[:n]
+		for _, c := range peers {
+			if err := proto.WriteBinaryFrame(c.tlsConn, &c.wmu, tidBytes, uint32(i), uint32(chunkCount), chunk); err != nil {
+				log.Printf("send chunk %d to %s: %v", i, c.PeerName, err)
+			}
+		}
+	}
+
+	log.Printf("sent %s (%d bytes, %d chunks) to %d peer(s)", filename, size, chunkCount, len(peers))
+	return nil
 }
 
 // SelfName returns this client's identity (from cert CN).

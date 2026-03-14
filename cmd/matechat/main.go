@@ -175,6 +175,7 @@ func runClient(cmd *cobra.Command, args []string) error {
 	msgCh := make(chan proto.ChatMsg, 64)
 	joinCh := make(chan string, 16)
 	leaveCh := make(chan string, 16)
+	fileCh := make(chan client.FileReceivedMsg, 16)
 
 	onMessage := func(msg proto.ChatMsg) {
 		select {
@@ -194,13 +195,19 @@ func runClient(cmd *cobra.Command, args []string) error {
 		default:
 		}
 	}
+	onFileReceived := func(from, filename, localPath string) {
+		select {
+		case fileCh <- client.FileReceivedMsg{From: from, Filename: filename, Path: localPath}:
+		default:
+		}
+	}
 
 	// Create peer manager
 	mgr := peer.NewManager(selfName, flagListen, clientTLS, serverTLS, st,
-		onMessage, onPeerJoin, onPeerLeave)
+		onMessage, onPeerJoin, onPeerLeave, onFileReceived)
 
 	// Create TUI model with manager and shared channels
-	model := client.New(mgr, st, msgCh, joinCh, leaveCh, version)
+	model := client.New(mgr, st, msgCh, joinCh, leaveCh, fileCh, version)
 
 	// Connect to broker
 	if err := mgr.ConnectBroker(cfg.Broker); err != nil {

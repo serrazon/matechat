@@ -2,9 +2,15 @@
 package peer
 
 import (
+	"bytes"
 	"crypto/tls"
+	"encoding/hex"
 	"encoding/json"
+	"fmt"
 	"log"
+	"os"
+	"path/filepath"
+	"strings"
 	"sync"
 	"time"
 
@@ -15,12 +21,14 @@ import (
 // Conn represents a single P2P connection to one peer.
 type Conn struct {
 	PeerName string
+	ConnType string // "direct", "holepunch", "relay"
 	tlsConn  *tls.Conn
 	wmu      sync.Mutex
 	store    *store.Store
 
-	onMessage func(proto.ChatMsg)
-	onLeave   func(name string)
+	onMessage      func(proto.ChatMsg)
+	onLeave        func(name string)
+	onFileReceived func(from, filename, localPath string)
 
 	closed chan struct{}
 	once   sync.Once
@@ -35,16 +43,19 @@ type incomingTransfer struct {
 	Chunks map[uint32][]byte
 }
 
-func newConn(peerName string, tlsConn *tls.Conn, st *store.Store,
-	onMessage func(proto.ChatMsg), onLeave func(string)) *Conn {
+func newConn(peerName, connType string, tlsConn *tls.Conn, st *store.Store,
+	onMessage func(proto.ChatMsg), onLeave func(string),
+	onFileReceived func(from, filename, localPath string)) *Conn {
 	return &Conn{
-		PeerName:  peerName,
-		tlsConn:   tlsConn,
-		store:     st,
-		onMessage: onMessage,
-		onLeave:   onLeave,
-		closed:    make(chan struct{}),
-		transfers: make(map[string]*incomingTransfer),
+		PeerName:       peerName,
+		ConnType:       connType,
+		tlsConn:        tlsConn,
+		store:          st,
+		onMessage:      onMessage,
+		onLeave:        onLeave,
+		onFileReceived: onFileReceived,
+		closed:         make(chan struct{}),
+		transfers:      make(map[string]*incomingTransfer),
 	}
 }
 
@@ -139,28 +150,78 @@ func (c *Conn) handleBinaryFrame(payload []byte) {
 		return
 	}
 
-	tid := string(transferID[:])
+	tid := hex.EncodeToString(transferID[:])
 
 	c.tmu.Lock()
-	defer c.tmu.Unlock()
-
 	t, ok := c.transfers[tid]
 	if !ok {
+		c.tmu.Unlock()
 		log.Printf("peer %s: binary chunk for unknown transfer", c.PeerName)
 		return
 	}
 
-	// Copy the chunk data
 	chunk := make([]byte, len(data))
 	copy(chunk, data)
 	t.Chunks[chunkIdx] = chunk
 
-	// Check if complete
-	if uint32(len(t.Chunks)) == chunkCount {
-		log.Printf("peer %s: file transfer complete: %s (%d bytes)",
-			c.PeerName, t.Meta.Filename, t.Meta.Size)
-		// TODO: reassemble and write to disk, call store.InsertTransfer
-		delete(c.transfers, tid)
+	if uint32(len(t.Chunks)) != chunkCount {
+		c.tmu.Unlock()
+		return
+	}
+
+	// All chunks received — extract and release lock before doing I/O.
+	meta := t.Meta
+	chunks := t.Chunks
+	delete(c.transfers, tid)
+	c.tmu.Unlock()
+
+	go c.finishTransfer(meta, chunks, chunkCount)
+}
+
+func (c *Conn) finishTransfer(meta proto.UploadStartMsg, chunks map[uint32][]byte, chunkCount uint32) {
+	// Reassemble in order.
+	var buf bytes.Buffer
+	for i := uint32(0); i < chunkCount; i++ {
+		buf.Write(chunks[i])
+	}
+
+	// Sanitize filename to prevent path traversal.
+	safeName := filepath.Base(meta.Filename)
+	if safeName == "." || safeName == string(filepath.Separator) {
+		safeName = "file"
+	}
+
+	// Resolve ~/Downloads, creating it if absent.
+	home, _ := os.UserHomeDir()
+	downloadsDir := filepath.Join(home, "Downloads")
+	if err := os.MkdirAll(downloadsDir, 0755); err != nil {
+		log.Printf("peer %s: create Downloads dir: %v", c.PeerName, err)
+		return
+	}
+
+	// Avoid overwriting an existing file by appending " (N)" before the extension.
+	outPath := filepath.Join(downloadsDir, safeName)
+	if _, err := os.Stat(outPath); err == nil {
+		ext := filepath.Ext(safeName)
+		base := strings.TrimSuffix(safeName, ext)
+		for n := 1; ; n++ {
+			outPath = filepath.Join(downloadsDir, fmt.Sprintf("%s (%d)%s", base, n, ext))
+			if _, err := os.Stat(outPath); os.IsNotExist(err) {
+				break
+			}
+		}
+	}
+
+	if err := os.WriteFile(outPath, buf.Bytes(), 0644); err != nil {
+		log.Printf("peer %s: write received file: %v", c.PeerName, err)
+		return
+	}
+
+	c.store.InsertTransfer(meta.TransferID, safeName, meta.Size, outPath, time.Now().UnixMilli())
+	log.Printf("peer %s: received %s → %s", c.PeerName, safeName, outPath)
+
+	if c.onFileReceived != nil {
+		c.onFileReceived(c.PeerName, safeName, outPath)
 	}
 }
 
